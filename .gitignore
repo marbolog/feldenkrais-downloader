@@ -1,0 +1,10 @@
+credentials.json
+token.json
+downloads/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+docs/
+scan_lessons.py
