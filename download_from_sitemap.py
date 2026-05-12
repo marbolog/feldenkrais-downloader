@@ -39,6 +39,40 @@ def extract_audio_url(page_text: str, page_url: str) -> str | None:
     return None
 
 
+def sync_to_drive(output_dir: str, folder_id: str, service_account_file: str | None = None, auth_port: int = 9090) -> None:
+    """Upload every audio file in output_dir that is not already in the Drive folder."""
+    import os
+    audio_files = sorted(
+        f for f in os.listdir(output_dir)
+        if os.path.splitext(f)[1].lower() in {".mp3", ".m4a", ".ogg"}
+    )
+    if not audio_files:
+        logger.info("No audio files found in %s/", output_dir)
+        return
+
+    logger.info("Syncing %d local file(s) to Google Drive folder %s...", len(audio_files), folder_id)
+    drive_service = get_drive_service(service_account_file, auth_port)
+    failed = 0
+    for filename in audio_files:
+        local_path = os.path.join(output_dir, filename)
+        try:
+            upload_file_to_drive(
+                service=drive_service,
+                file_path=local_path,
+                filename=filename,
+                folder_id=folder_id,
+            )
+        except Exception as exc:
+            logger.warning("GDrive upload failed for %s: %s", filename, exc)
+            failed += 1
+
+    logger.info(
+        "Sync complete: %d file(s) processed, %d failed.",
+        len(audio_files) - failed,
+        failed,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download free Feldenkrais lessons via sitemap.")
     parser.add_argument("--output-dir", default="downloads")
@@ -46,9 +80,36 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--download-delay", type=float, default=0.5)
+    parser.add_argument(
+        "--sync-only",
+        action="store_true",
+        help="Skip download; upload all local audio files in --output-dir to Drive.",
+    )
+    parser.add_argument(
+        "--service-account-file",
+        type=str,
+        default=None,
+        metavar="SA_JSON",
+        help="Path to a GCP service account JSON key for headless Drive auth.",
+    )
+    parser.add_argument(
+        "--auth-port",
+        type=int,
+        default=9090,
+        metavar="PORT",
+        help="Local port for the OAuth callback server (default: 9090).",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
+
+    if args.sync_only:
+        if not args.gdrive_folder_id:
+            logger.error("--gdrive-folder-id is required for --sync-only.")
+            return
+        sync_to_drive(args.output_dir, args.gdrive_folder_id, args.service_account_file, args.auth_port)
+        return
+
     session = get_requests_session()
 
     logger.info("Fetching lesson list from sitemap...")
@@ -84,7 +145,7 @@ def main() -> None:
 
     if args.gdrive_folder_id and downloaded_files:
         logger.info("Uploading %d file(s) to Google Drive...", len(downloaded_files))
-        drive_service = get_drive_service()
+        drive_service = get_drive_service(args.service_account_file, args.auth_port)
         for local_path in downloaded_files:
             import os
             filename = os.path.basename(local_path)

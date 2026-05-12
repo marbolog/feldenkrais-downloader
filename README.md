@@ -18,19 +18,20 @@ The patron-only lessons cannot be downloaded without authentication credentials 
 Reads the Yoast SEO lesson sitemap directly — 175 known URLs, no BFS crawl needed. Scans each page for a Podlove audio URL, downloads all free lessons, and optionally uploads to Google Drive.
 
 ```bash
-source venv/bin/activate
-
 # Download everything (skips already-downloaded files)
-python download_from_sitemap.py
+uv run python download_from_sitemap.py
 
 # Specify a different output directory
-python download_from_sitemap.py --output-dir /path/to/audio
+uv run python download_from_sitemap.py --output-dir /path/to/audio
 
 # Override the Google Drive folder (default: 1DoeAFcPcKXxw25bwXyaooTAWA0BfFLy0)
-python download_from_sitemap.py --gdrive-folder-id YOUR_FOLDER_ID
+uv run python download_from_sitemap.py --gdrive-folder-id YOUR_FOLDER_ID
 
 # Tune concurrency and rate-limiting
-python download_from_sitemap.py --workers 8 --download-delay 0.25
+uv run python download_from_sitemap.py --workers 8 --download-delay 0.25
+
+# Sync already-downloaded files to Google Drive (no re-download)
+uv run python download_from_sitemap.py --sync-only
 ```
 
 | Flag | Default | Description |
@@ -40,6 +41,8 @@ python download_from_sitemap.py --workers 8 --download-delay 0.25
 | `--workers` | `4` | Parallel download threads |
 | `--download-delay` | `0.5` | Seconds between downloads |
 | `--log-level` | `INFO` | Verbosity (`DEBUG`, `INFO`, `WARNING`) |
+| `--sync-only` | off | Skip download; upload all local files to Drive |
+| `--auth-port` | `9090` | Local port for the OAuth callback server |
 
 Typical runtime: ~2 minutes for 175 page fetches + download time.
 
@@ -50,8 +53,8 @@ Typical runtime: ~2 minutes for 175 page fetches + download time.
 Full-site BFS crawl using `requests` + `BeautifulSoup`. Discovers audio URLs from tags and inline scripts. Not recommended for this site: wastes time crawling 1,400+ non-lesson pages (pagination, categories, query-string variants).
 
 ```bash
-python feldenkrais_downloader.py
-python feldenkrais_downloader.py --path-substring-filter /lesson/ --gdrive-folder-id YOUR_FOLDER_ID
+uv run python feldenkrais_downloader.py
+uv run python feldenkrais_downloader.py --path-substring-filter /lesson/ --gdrive-folder-id YOUR_FOLDER_ID
 ```
 
 | Flag | Default | Description |
@@ -71,8 +74,8 @@ python feldenkrais_downloader.py --path-substring-filter /lesson/ --gdrive-folde
 Opens each lesson page in a headless browser and captures audio URLs from network traffic and the DOM. Useful if the Podlove regex ever breaks. Cannot bypass the patron-only Bumper player (RCP blocks the player from rendering entirely for anonymous users, so there is nothing to capture).
 
 ```bash
-python feldenkrais_downloader_playwright.py
-python feldenkrais_downloader_playwright.py --single-lesson-url https://feldenkraisproject.com/lesson/some-lesson/
+uv run python feldenkrais_downloader_playwright.py
+uv run python feldenkrais_downloader_playwright.py --single-lesson-url https://feldenkraisproject.com/lesson/some-lesson/
 ```
 
 | Flag | Default | Description |
@@ -90,13 +93,13 @@ python feldenkrais_downloader_playwright.py --single-lesson-url https://feldenkr
 ## Requirements
 
 ```bash
-pip install -r requirements.txt
-playwright install chromium   # only for feldenkrais_downloader_playwright.py
+uv sync
+uv run playwright install chromium   # only for feldenkrais_downloader_playwright.py
 ```
 
-Python 3.10+ required.
+Python 3.10+ required. Install `uv` with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
-For Google Drive upload you need a `credentials.json` OAuth2 client secrets file in the working directory ([Google Drive quickstart](https://developers.google.com/drive/api/quickstart/python)). `token.json` is created automatically on first auth and reused on subsequent runs.
+For Google Drive upload you need a `credentials.json` OAuth2 **Desktop app** client secrets file in the working directory ([GCP Console](https://console.cloud.google.com/) → APIs & Services → Credentials → Create OAuth 2.0 Client ID → Desktop app). `token.json` is created automatically on first auth and reused on subsequent runs.
 
 ## Output
 

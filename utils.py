@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -16,6 +17,7 @@ from googleapiclient.http import MediaFileUpload
 
 BASE_URL = "https://feldenkraisproject.com/"
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+SA_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +197,18 @@ def download_audio_files(
     return downloaded
 
 
-def get_drive_service():
-    """Return an authenticated Google Drive v3 service using OAuth2 stored in token.json."""
+def get_drive_service(service_account_file: str | None = None, auth_port: int = 9090):
+    """Return an authenticated Google Drive v3 service.
+
+    If service_account_file is given, authenticates as a service account (headless).
+    Otherwise falls back to OAuth2 using token.json / credentials.json.
+    """
+    if service_account_file:
+        creds = service_account.Credentials.from_service_account_file(
+            service_account_file, scopes=SA_SCOPES
+        )
+        return build("drive", "v3", credentials=creds)
+
     creds: Credentials | None = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
@@ -205,7 +217,15 @@ def get_drive_service():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=False)
+            logger.info(
+                "Opening auth server on port %d. "
+                "If on a remote machine, forward the port through your relay:\n"
+                "  ssh -L %d:localhost:%d ubuntu@204.216.222.110 "
+                "-t ssh -L %d:localhost:%d -p 2222 marcello@localhost\n"
+                "Then visit the URL printed below in your local browser.",
+                auth_port, auth_port, auth_port, auth_port, auth_port,
+            )
+            creds = flow.run_local_server(port=auth_port, open_browser=False)
         with open("token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
     return build("drive", "v3", credentials=creds)
