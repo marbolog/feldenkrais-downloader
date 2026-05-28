@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -16,8 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 BASE_URL = "https://feldenkraisproject.com/"
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-SA_SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +57,20 @@ def get_requests_session() -> requests.Session:
     return session
 
 
-def filename_from_url(url: str) -> str:
-    """Return a collision-safe filename: {basename}_{hash6}.{ext} where hash6 = sha256(url)[:6]."""
+def filename_from_url(url: str, index: int | None = None, slug: str | None = None) -> str:
+    """Return a collision-safe filename.
+
+    With index: {index:04d}_{slug or basename}_{hash6}.{ext}
+    Without:    {basename}_{hash6}.{ext}  (legacy, used for backward-compat checks)
+    """
     path = urllib.parse.urlparse(url).path
     name = os.path.basename(path) or "audio"
     root, ext = os.path.splitext(name)
+    ext = ext.lower()
     hash6 = hashlib.sha256(url.encode()).hexdigest()[:6]
+    if index is not None:
+        base = slug if slug else root
+        return f"{index:04d}_{base}_{hash6}{ext}"
     return f"{root}_{hash6}{ext}"
 
 
@@ -107,14 +115,25 @@ def _download_one(
     output_dir: str,
     manifest_path: str,
     manifest_lock: threading.Lock,
+    index: int | None = None,
+    slug: str | None = None,
 ) -> str | None:
     """Download a single audio file. Returns local path on success, None on skip/failure."""
-    filename = filename_from_url(url)
+    filename = filename_from_url(url, index=index, slug=slug)
     local_path = os.path.join(output_dir, filename)
 
     if os.path.exists(local_path):
         logger.info("SKIP already downloaded: %s", filename)
         return None
+
+    # Auto-rename a file that was saved under the legacy (un-indexed) name
+    if index is not None:
+        old_filename = filename_from_url(url)
+        old_path = os.path.join(output_dir, old_filename)
+        if os.path.exists(old_path):
+            os.rename(old_path, local_path)
+            logger.info("RENAMED %s → %s", old_filename, filename)
+            return local_path
 
     logger.info("DOWNLOAD %s", url)
     session = get_requests_session()
@@ -173,8 +192,12 @@ def download_audio_files(
     delay_seconds: float = 1.0,
     max_workers: int = 4,
     manifest_name: str = "manifest.jsonl",
+    url_to_meta: "dict[str, tuple[int, str]] | None" = None,
 ) -> list[str]:
-    """Download audio files concurrently. Returns list of newly-downloaded local paths."""
+    """Download audio files concurrently. Returns list of newly-downloaded local paths.
+
+    url_to_meta maps audio_url → (order_index, lesson_slug) for ordered filenames.
+    """
     ensure_directory(output_dir)
     manifest_path = os.path.join(output_dir, manifest_name)
     manifest_lock = threading.Lock()
@@ -183,7 +206,11 @@ def download_audio_files(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for url in sorted(audio_urls):
-            future = executor.submit(_download_one, url, output_dir, manifest_path, manifest_lock)
+            meta = url_to_meta.get(url) if url_to_meta else None
+            index, slug = meta if meta else (None, None)
+            future = executor.submit(
+                _download_one, url, output_dir, manifest_path, manifest_lock, index, slug
+            )
             futures[future] = url
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
@@ -197,6 +224,65 @@ def download_audio_files(
     return downloaded
 
 
+def rename_downloaded_files(
+    output_dir: str,
+    url_to_meta: "dict[str, tuple[int, str]]",
+    manifest_name: str = "manifest.jsonl",
+) -> int:
+    """Rename files in output_dir using url_to_meta index/slug mapping.
+
+    Reads the manifest to discover current filenames, renames files on disk,
+    and rewrites the manifest with updated paths. Returns count of files renamed.
+    """
+    manifest_path = os.path.join(output_dir, manifest_name)
+    if not os.path.exists(manifest_path):
+        logger.warning("No manifest found at %s — nothing to rename.", manifest_path)
+        return 0
+
+    entries = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    renamed = 0
+    for entry in entries:
+        url = entry.get("url", "")
+        meta = url_to_meta.get(url)
+        if not meta:
+            continue
+        index, slug = meta
+        new_filename = filename_from_url(url, index=index, slug=slug)
+        current_filename = entry.get("filename", "")
+        if current_filename == new_filename:
+            continue
+        old_path = os.path.join(output_dir, current_filename)
+        new_path = os.path.join(output_dir, new_filename)
+        if not os.path.exists(old_path):
+            logger.debug("SKIP rename (source missing): %s", current_filename)
+            continue
+        if os.path.exists(new_path):
+            logger.info("SKIP rename (target exists): %s", new_filename)
+            entry["filename"] = new_filename
+            entry["local_path"] = new_path
+            continue
+        os.rename(old_path, new_path)
+        logger.info("RENAMED %s → %s", current_filename, new_filename)
+        entry["filename"] = new_filename
+        entry["local_path"] = new_path
+        renamed += 1
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+    return renamed
+
+
 def get_drive_service(service_account_file: str | None = None, auth_port: int = 9090):
     """Return an authenticated Google Drive v3 service.
 
@@ -205,7 +291,7 @@ def get_drive_service(service_account_file: str | None = None, auth_port: int = 
     """
     if service_account_file:
         creds = service_account.Credentials.from_service_account_file(
-            service_account_file, scopes=SA_SCOPES
+            service_account_file, scopes=SCOPES
         )
         return build("drive", "v3", credentials=creds)
 
@@ -229,6 +315,109 @@ def get_drive_service(service_account_file: str | None = None, auth_port: int = 
         with open("token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
     return build("drive", "v3", credentials=creds)
+
+
+def list_drive_files(service, folder_id: str) -> list[dict]:
+    """Return all non-trashed files in folder_id visible to the current credentials."""
+    files_resource = service.files() if callable(getattr(service, "files", None)) else service.files
+    query = f"'{folder_id}' in parents and trashed = false"
+    results, page_token = [], None
+    while True:
+        resp = files_resource.list(
+            q=query,
+            spaces="drive",
+            fields="nextPageToken, files(id, name, createdTime, size, md5Checksum)",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        results.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def dedupe_drive_folder(service, folder_id: str, *, dry_run: bool = True) -> None:
+    """Find content-identical files in folder_id and delete all but the best-named copy."""
+    files_resource = service.files() if callable(getattr(service, "files", None)) else service.files
+    all_files = list_drive_files(service, folder_id)
+    logger.info("Found %d file(s) in Drive folder.", len(all_files))
+
+    # Group by md5 (content identity); files without md5 (e.g. Google Docs) are skipped.
+    by_md5: dict[str, list[dict]] = {}
+    for f in all_files:
+        md5 = f.get("md5Checksum")
+        if md5:
+            by_md5.setdefault(md5, []).append(f)
+
+    duplicates = {md5: copies for md5, copies in by_md5.items() if len(copies) > 1}
+    if not duplicates:
+        logger.info("No content-identical duplicates found.")
+        return
+
+    total_extras = sum(len(v) - 1 for v in duplicates.values())
+    logger.info("Found %d content group(s) with duplicates (%d file(s) to remove):", len(duplicates), total_extras)
+    deleted = 0
+    for md5, copies in sorted(duplicates.items(), key=lambda x: x[1][0]["name"]):
+        # Prefer the copy whose name matches our hash-suffix convention; else keep oldest.
+        copies.sort(key=lambda f: (
+            0 if re.search(r"_[0-9a-f]{6}\.(mp3|m4a|ogg)$", f["name"], re.IGNORECASE) else 1,
+            f.get("createdTime", ""),
+        ))
+        keep, *extras = copies
+        logger.info("  md5=%s — keeping '%s', removing %d extra(s):", md5[:8], keep["name"], len(extras))
+        for extra in extras:
+            logger.info("    '%s' (id=%s created=%s)", extra["name"], extra["id"], extra.get("createdTime", "?"))
+            if not dry_run:
+                files_resource.delete(fileId=extra["id"]).execute()
+                deleted += 1
+
+    if dry_run:
+        logger.info("Dry run complete — %d file(s) would be deleted. Re-run with --no-dry-run to apply.", total_extras)
+    else:
+        logger.info("Deleted %d duplicate file(s).", deleted)
+
+
+def rename_drive_files(
+    service,
+    folder_id: str,
+    url_to_meta: "dict[str, tuple[int, str]]",
+) -> int:
+    """Rename files in a Drive folder to include order index and lesson slug.
+
+    Computes old→new filename pairs from url_to_meta, lists Drive folder contents,
+    and renames matching files via a metadata-only files.update() call.
+    Returns count of files renamed.
+    """
+    files_resource = service.files() if callable(getattr(service, "files", None)) else service.files
+
+    rename_map: dict[str, str] = {}
+    for url, (index, slug) in url_to_meta.items():
+        old_name = filename_from_url(url)
+        new_name = filename_from_url(url, index=index, slug=slug)
+        if old_name != new_name:
+            rename_map[old_name] = new_name
+
+    if not rename_map:
+        logger.info("No Drive files to rename.")
+        return 0
+
+    drive_files = list_drive_files(service, folder_id)
+    logger.info("Scanning %d Drive file(s) for renames...", len(drive_files))
+
+    renamed = 0
+    for f in drive_files:
+        new_name = rename_map.get(f["name"])
+        if not new_name:
+            continue
+        try:
+            files_resource.update(fileId=f["id"], body={"name": new_name}).execute()
+            logger.info("Drive RENAMED %s → %s", f["name"], new_name)
+            renamed += 1
+        except Exception as exc:
+            logger.warning("Drive rename failed for %s: %s", f["name"], exc)
+
+    return renamed
 
 
 def upload_file_to_drive(service, file_path: str, filename: str, folder_id: str) -> None:

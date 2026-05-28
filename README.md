@@ -32,6 +32,13 @@ uv run python download_from_sitemap.py --workers 8 --download-delay 0.25
 
 # Sync already-downloaded files to Google Drive (no re-download)
 uv run python download_from_sitemap.py --sync-only
+
+# Rename existing local + Drive files to indexed order (oldest-first by sitemap lastmod)
+uv run python download_from_sitemap.py --rename-downloads --service-account-file sa.json
+
+# Preview duplicate files in the Drive folder, then delete them
+uv run python download_from_sitemap.py --dedupe-drive --service-account-file sa.json
+uv run python download_from_sitemap.py --dedupe-drive --no-dry-run --service-account-file sa.json
 ```
 
 | Flag | Default | Description |
@@ -43,6 +50,10 @@ uv run python download_from_sitemap.py --sync-only
 | `--log-level` | `INFO` | Verbosity (`DEBUG`, `INFO`, `WARNING`) |
 | `--sync-only` | off | Skip download; upload all local files to Drive |
 | `--auth-port` | `9090` | Local port for the OAuth callback server |
+| `--service-account-file` | *(none)* | GCP service account JSON key for headless Drive auth |
+| `--rename-downloads` | off | Rename local + Drive files to `{index}_{slug}_{hash}.ext` ordering |
+| `--dedupe-drive` | off | Detect and remove content-identical duplicates in the Drive folder (dry-run by default) |
+| `--no-dry-run` | off | Apply deletions when used with `--dedupe-drive` |
 
 Typical runtime: ~2 minutes for 175 page fetches + download time.
 

@@ -7,11 +7,14 @@ import requests
 
 from utils import (
     BASE_URL,
+    dedupe_drive_folder,
     download_audio_files,
     get_drive_service,
     get_requests_session,
     is_audio_url,
     normalize_url,
+    rename_downloaded_files,
+    rename_drive_files,
     setup_logging,
     upload_file_to_drive,
 )
@@ -21,10 +24,28 @@ LESSON_SITEMAP = "https://feldenkraisproject.com/lesson-sitemap.xml"
 logger = logging.getLogger(__name__)
 
 
-def fetch_lesson_urls(session: requests.Session) -> list[str]:
+def fetch_lesson_entries(session: requests.Session) -> list[tuple[str, str]]:
+    """Return (url, lastmod) pairs sorted oldest-first by lastmod date."""
     resp = session.get(LESSON_SITEMAP, timeout=20)
     resp.raise_for_status()
-    return re.findall(r"<loc>(https://feldenkraisproject\.com/lesson/[^<]+)</loc>", resp.text)
+    entries = []
+    for block in re.finditer(r"<url>(.*?)</url>", resp.text, re.DOTALL):
+        loc = re.search(
+            r"<loc>(https://feldenkraisproject\.com/lesson/[^<]+)</loc>", block.group(1)
+        )
+        if not loc:
+            continue
+        lastmod = re.search(r"<lastmod>([^<]+)</lastmod>", block.group(1))
+        entries.append((loc.group(1), lastmod.group(1).strip() if lastmod else ""))
+    entries.sort(key=lambda x: x[1])
+    return entries
+
+
+def _lesson_slug(lesson_url: str) -> str:
+    """Extract slug: https://.../lesson/rolling-on-the-side/ → 'rolling-on-the-side'"""
+    import urllib.parse as _up
+    path = _up.urlparse(lesson_url).path.rstrip("/")
+    return path.split("/")[-1]
 
 
 def extract_audio_url(page_text: str, page_url: str) -> str | None:
@@ -99,9 +120,32 @@ def main() -> None:
         metavar="PORT",
         help="Local port for the OAuth callback server (default: 9090).",
     )
+    parser.add_argument(
+        "--dedupe-drive",
+        action="store_true",
+        help="Find and remove duplicate filenames in the Drive folder.",
+    )
+    parser.add_argument(
+        "--no-dry-run",
+        action="store_true",
+        help="Actually delete duplicates (default is dry-run preview).",
+    )
+    parser.add_argument(
+        "--rename-downloads",
+        action="store_true",
+        help="Rename already-downloaded files to include upload-order index and lesson slug.",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
+
+    if args.dedupe_drive:
+        if not args.gdrive_folder_id:
+            logger.error("--gdrive-folder-id is required for --dedupe-drive.")
+            return
+        drive_service = get_drive_service(args.service_account_file, args.auth_port)
+        dedupe_drive_folder(drive_service, args.gdrive_folder_id, dry_run=not args.no_dry_run)
+        return
 
     if args.sync_only:
         if not args.gdrive_folder_id:
@@ -113,11 +157,30 @@ def main() -> None:
     session = get_requests_session()
 
     logger.info("Fetching lesson list from sitemap...")
-    lesson_urls = fetch_lesson_urls(session)
-    logger.info("Found %d lesson URLs in sitemap.", len(lesson_urls))
+    lesson_entries = fetch_lesson_entries(session)
+    logger.info("Found %d lesson URLs in sitemap (sorted oldest-first).", len(lesson_entries))
 
-    audio_urls: set[str] = set()
-    for i, url in enumerate(lesson_urls, 1):
+    if args.rename_downloads:
+        audio_url_to_meta: dict[str, tuple[int, str]] = {}
+        for i, (url, _lastmod) in enumerate(lesson_entries, 1):
+            try:
+                resp = session.get(url, timeout=15)
+            except requests.RequestException as exc:
+                logger.warning("Failed to fetch %s: %s", url, exc)
+                continue
+            audio = extract_audio_url(resp.text, url)
+            if audio:
+                audio_url_to_meta[audio] = (i, _lesson_slug(url))
+        count = rename_downloaded_files(args.output_dir, audio_url_to_meta)
+        logger.info("Renamed %d local file(s).", count)
+        if args.gdrive_folder_id:
+            drive_service = get_drive_service(args.service_account_file, args.auth_port)
+            drive_count = rename_drive_files(drive_service, args.gdrive_folder_id, audio_url_to_meta)
+            logger.info("Renamed %d Drive file(s).", drive_count)
+        return
+
+    audio_url_to_meta = {}
+    for i, (url, _lastmod) in enumerate(lesson_entries, 1):
         try:
             resp = session.get(url, timeout=15)
         except requests.RequestException as exc:
@@ -125,22 +188,27 @@ def main() -> None:
             continue
         audio = extract_audio_url(resp.text, url)
         if audio:
-            audio_urls.add(audio)
-            logger.info("[%d/%d] Found audio: %s", i, len(lesson_urls), audio.split("amazonaws.com/")[1])
+            audio_url_to_meta[audio] = (i, _lesson_slug(url))
+            logger.info("[%d/%d] Found audio: %s", i, len(lesson_entries), audio.split("amazonaws.com/")[1])
         else:
-            logger.debug("[%d/%d] No audio (patron-only): %s", i, len(lesson_urls), url)
+            logger.debug("[%d/%d] No audio (patron-only): %s", i, len(lesson_entries), url)
 
-    logger.info("Found %d downloadable audio file(s) out of %d lessons.", len(audio_urls), len(lesson_urls))
-    if not audio_urls:
+    logger.info(
+        "Found %d downloadable audio file(s) out of %d lessons.",
+        len(audio_url_to_meta),
+        len(lesson_entries),
+    )
+    if not audio_url_to_meta:
         logger.info("Nothing to download.")
         return
 
     downloaded_files = download_audio_files(
-        audio_urls=audio_urls,
+        audio_urls=set(audio_url_to_meta.keys()),
         output_dir=args.output_dir,
         delay_seconds=args.download_delay,
         max_workers=args.workers,
         manifest_name="manifest.jsonl",
+        url_to_meta=audio_url_to_meta,
     )
 
     if args.gdrive_folder_id and downloaded_files:
