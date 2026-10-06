@@ -1,7 +1,11 @@
 """Download all free Feldenkrais lessons by scanning the lesson sitemap directly."""
 import argparse
 import logging
+import os
 import re
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -9,6 +13,8 @@ from utils import (
     BASE_URL,
     dedupe_drive_folder,
     download_audio_files,
+    drive_tags,
+    fetch_with_retry,
     get_drive_service,
     get_requests_session,
     is_audio_url,
@@ -43,8 +49,7 @@ def fetch_lesson_entries(session: requests.Session) -> list[tuple[str, str]]:
 
 def _lesson_slug(lesson_url: str) -> str:
     """Extract slug: https://.../lesson/rolling-on-the-side/ → 'rolling-on-the-side'"""
-    import urllib.parse as _up
-    path = _up.urlparse(lesson_url).path.rstrip("/")
+    path = urllib.parse.urlparse(lesson_url).path.rstrip("/")
     return path.split("/")[-1]
 
 
@@ -60,9 +65,89 @@ def extract_audio_url(page_text: str, page_url: str) -> str | None:
     return None
 
 
-def sync_to_drive(output_dir: str, folder_id: str, service_account_file: str | None = None, auth_port: int = 9090) -> None:
+def scan_lessons(
+    session: requests.Session, lesson_entries: list[tuple[str, str]], workers: int = 4
+) -> dict[str, tuple[int, str]]:
+    """Fetch every lesson page and map audio_url -> (sitemap_index, slug). Patron-only lessons are omitted.
+
+    Pages that fail (network error or HTTP >= 400, e.g. 503 rate limiting) are retried
+    serially so they are never mistaken for patron-only lessons.
+    """
+
+    def scan(item: tuple[int, tuple[str, str]]) -> tuple[int, str, str | None, bool]:
+        i, (url, _lastmod) = item
+        try:
+            resp = fetch_with_retry(session, url, timeout=15)
+        except requests.RequestException as exc:
+            logger.warning("Failed to fetch %s: %s", url, exc)
+            return i, url, None, False
+        if resp.status_code >= 400:
+            logger.warning("HTTP %s for %s", resp.status_code, url)
+            return i, url, None, False
+        return i, url, extract_audio_url(resp.text, url), True
+
+    meta: dict[str, tuple[int, str]] = {}
+
+    def record(i: int, url: str, audio: str | None) -> None:
+        if audio:
+            meta[audio] = (i, _lesson_slug(url))
+            logger.debug("[%d/%d] Found audio: %s", i, len(lesson_entries), audio)
+        else:
+            logger.debug("[%d/%d] No audio (patron-only): %s", i, len(lesson_entries), url)
+
+    items = list(enumerate(lesson_entries, 1))
+    failed: list[tuple[int, tuple[str, str]]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for item, (i, url, audio, ok) in zip(items, pool.map(scan, items)):
+            if ok:
+                record(i, url, audio)
+            else:
+                failed.append(item)
+
+    for round_no in range(1, 4):
+        if not failed:
+            break
+        logger.info("Retrying %d failed page(s) serially (round %d)...", len(failed), round_no)
+        still_failed = []
+        for item in failed:
+            time.sleep(2 * round_no)
+            i, url, audio, ok = scan(item)
+            if ok:
+                record(i, url, audio)
+            else:
+                still_failed.append(item)
+        failed = still_failed
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} lesson page(s) could not be scanned: "
+            + ", ".join(url for _, (url, _) in failed)
+        )
+    return meta
+
+
+def upload_new_files(paths: list[str], folder_id: str, drive_service) -> int:
+    """Upload local files not yet in the Drive folder (matched by name or URL hash). Returns uploaded count."""
+    known = drive_tags(drive_service, folder_id)
+    uploaded = 0
+    for path in paths:
+        filename = os.path.basename(path)
+        try:
+            if upload_file_to_drive(drive_service, path, filename, folder_id, known_tags=known):
+                uploaded += 1
+        except Exception as exc:
+            logger.warning("GDrive upload failed for %s: %s", filename, exc)
+    return uploaded
+
+
+def sync_to_drive(
+    output_dir: str,
+    folder_id: str,
+    service_account_file: str | None = None,
+    auth_port: int = 9090,
+    console_auth: bool = False,
+    auth_code: str | None = None,
+) -> None:
     """Upload every audio file in output_dir that is not already in the Drive folder."""
-    import os
     audio_files = sorted(
         f for f in os.listdir(output_dir)
         if os.path.splitext(f)[1].lower() in {".mp3", ".m4a", ".ogg"}
@@ -72,26 +157,9 @@ def sync_to_drive(output_dir: str, folder_id: str, service_account_file: str | N
         return
 
     logger.info("Syncing %d local file(s) to Google Drive folder %s...", len(audio_files), folder_id)
-    drive_service = get_drive_service(service_account_file, auth_port)
-    failed = 0
-    for filename in audio_files:
-        local_path = os.path.join(output_dir, filename)
-        try:
-            upload_file_to_drive(
-                service=drive_service,
-                file_path=local_path,
-                filename=filename,
-                folder_id=folder_id,
-            )
-        except Exception as exc:
-            logger.warning("GDrive upload failed for %s: %s", filename, exc)
-            failed += 1
-
-    logger.info(
-        "Sync complete: %d file(s) processed, %d failed.",
-        len(audio_files) - failed,
-        failed,
-    )
+    drive_service = get_drive_service(service_account_file, auth_port, console_auth, auth_code)
+    uploaded = upload_new_files([os.path.join(output_dir, f) for f in audio_files], folder_id, drive_service)
+    logger.info("Sync complete: %d new file(s) uploaded, %d already on Drive.", uploaded, len(audio_files) - uploaded)
 
 
 def main() -> None:
@@ -135,6 +203,18 @@ def main() -> None:
         action="store_true",
         help="Rename already-downloaded files to include upload-order index and lesson slug.",
     )
+    parser.add_argument(
+        "--console-auth",
+        action="store_true",
+        help="Use copy-paste OAuth flow instead of a local server (useful over SSH without port forwarding).",
+    )
+    parser.add_argument(
+        "--auth-code",
+        type=str,
+        default=None,
+        metavar="CODE",
+        help="Authorization code from Google (phase 2 of --console-auth flow).",
+    )
     args = parser.parse_args()
 
     setup_logging(args.log_level)
@@ -143,7 +223,7 @@ def main() -> None:
         if not args.gdrive_folder_id:
             logger.error("--gdrive-folder-id is required for --dedupe-drive.")
             return
-        drive_service = get_drive_service(args.service_account_file, args.auth_port)
+        drive_service = get_drive_service(args.service_account_file, args.auth_port, args.console_auth, args.auth_code)
         dedupe_drive_folder(drive_service, args.gdrive_folder_id, dry_run=not args.no_dry_run)
         return
 
@@ -151,7 +231,7 @@ def main() -> None:
         if not args.gdrive_folder_id:
             logger.error("--gdrive-folder-id is required for --sync-only.")
             return
-        sync_to_drive(args.output_dir, args.gdrive_folder_id, args.service_account_file, args.auth_port)
+        sync_to_drive(args.output_dir, args.gdrive_folder_id, args.service_account_file, args.auth_port, args.console_auth, args.auth_code)
         return
 
     session = get_requests_session()
@@ -160,44 +240,22 @@ def main() -> None:
     lesson_entries = fetch_lesson_entries(session)
     logger.info("Found %d lesson URLs in sitemap (sorted oldest-first).", len(lesson_entries))
 
-    if args.rename_downloads:
-        audio_url_to_meta: dict[str, tuple[int, str]] = {}
-        for i, (url, _lastmod) in enumerate(lesson_entries, 1):
-            try:
-                resp = session.get(url, timeout=15)
-            except requests.RequestException as exc:
-                logger.warning("Failed to fetch %s: %s", url, exc)
-                continue
-            audio = extract_audio_url(resp.text, url)
-            if audio:
-                audio_url_to_meta[audio] = (i, _lesson_slug(url))
-        count = rename_downloaded_files(args.output_dir, audio_url_to_meta)
-        logger.info("Renamed %d local file(s).", count)
-        if args.gdrive_folder_id:
-            drive_service = get_drive_service(args.service_account_file, args.auth_port)
-            drive_count = rename_drive_files(drive_service, args.gdrive_folder_id, audio_url_to_meta)
-            logger.info("Renamed %d Drive file(s).", drive_count)
-        return
-
-    audio_url_to_meta = {}
-    for i, (url, _lastmod) in enumerate(lesson_entries, 1):
-        try:
-            resp = session.get(url, timeout=15)
-        except requests.RequestException as exc:
-            logger.warning("Failed to fetch %s: %s", url, exc)
-            continue
-        audio = extract_audio_url(resp.text, url)
-        if audio:
-            audio_url_to_meta[audio] = (i, _lesson_slug(url))
-            logger.info("[%d/%d] Found audio: %s", i, len(lesson_entries), audio.split("amazonaws.com/")[1])
-        else:
-            logger.debug("[%d/%d] No audio (patron-only): %s", i, len(lesson_entries), url)
-
+    audio_url_to_meta = scan_lessons(session, lesson_entries, workers=args.workers)
     logger.info(
         "Found %d downloadable audio file(s) out of %d lessons.",
         len(audio_url_to_meta),
         len(lesson_entries),
     )
+
+    if args.rename_downloads:
+        count = rename_downloaded_files(args.output_dir, audio_url_to_meta)
+        logger.info("Renamed %d local file(s).", count)
+        if args.gdrive_folder_id:
+            drive_service = get_drive_service(args.service_account_file, args.auth_port, args.console_auth, args.auth_code)
+            drive_count = rename_drive_files(drive_service, args.gdrive_folder_id, audio_url_to_meta)
+            logger.info("Renamed %d Drive file(s).", drive_count)
+        return
+
     if not audio_url_to_meta:
         logger.info("Nothing to download.")
         return
@@ -213,19 +271,8 @@ def main() -> None:
 
     if args.gdrive_folder_id and downloaded_files:
         logger.info("Uploading %d file(s) to Google Drive...", len(downloaded_files))
-        drive_service = get_drive_service(args.service_account_file, args.auth_port)
-        for local_path in downloaded_files:
-            import os
-            filename = os.path.basename(local_path)
-            try:
-                upload_file_to_drive(
-                    service=drive_service,
-                    file_path=local_path,
-                    filename=filename,
-                    folder_id=args.gdrive_folder_id,
-                )
-            except Exception as exc:
-                logger.warning("GDrive upload failed for %s: %s", filename, exc)
+        drive_service = get_drive_service(args.service_account_file, args.auth_port, args.console_auth, args.auth_code)
+        upload_new_files(downloaded_files, args.gdrive_folder_id, drive_service)
 
     logger.info("Done. Downloaded %d file(s) to %s/", len(downloaded_files), args.output_dir)
 

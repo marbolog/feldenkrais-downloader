@@ -74,6 +74,20 @@ def filename_from_url(url: str, index: int | None = None, slug: str | None = Non
     return f"{root}_{hash6}{ext}"
 
 
+_TAG_RE = re.compile(r"_([0-9a-f]{6})\.(?:mp3|m4a|ogg)$", re.IGNORECASE)
+
+
+def url_tag(url: str) -> str:
+    """The 6-char URL hash embedded in every filename we generate (stable across renames)."""
+    return hashlib.sha256(url.encode()).hexdigest()[:6]
+
+
+def file_tag(filename: str) -> str | None:
+    """Extract the URL hash tag from a filename produced by filename_from_url()."""
+    m = _TAG_RE.search(filename)
+    return m.group(1).lower() if m else None
+
+
 def fetch_with_retry(
     session: requests.Session,
     url: str,
@@ -126,14 +140,17 @@ def _download_one(
         logger.info("SKIP already downloaded: %s", filename)
         return None
 
-    # Auto-rename a file that was saved under the legacy (un-indexed) name
-    if index is not None:
-        old_filename = filename_from_url(url)
-        old_path = os.path.join(output_dir, old_filename)
-        if os.path.exists(old_path):
-            os.rename(old_path, local_path)
-            logger.info("RENAMED %s → %s", old_filename, filename)
-            return local_path
+    # The sitemap position (index) can shift between runs, so match an existing
+    # copy by its URL hash tag rather than by exact name; never re-download it.
+    tag = url_tag(url)
+    for existing in sorted(os.listdir(output_dir)):
+        if file_tag(existing) == tag:
+            if index is not None:
+                os.rename(os.path.join(output_dir, existing), local_path)
+                logger.info("RENAMED %s → %s", existing, filename)
+                return local_path
+            logger.info("SKIP already downloaded: %s", existing)
+            return None
 
     logger.info("DOWNLOAD %s", url)
     session = get_requests_session()
@@ -283,11 +300,18 @@ def rename_downloaded_files(
     return renamed
 
 
-def get_drive_service(service_account_file: str | None = None, auth_port: int = 9090):
+def get_drive_service(
+    service_account_file: str | None = None,
+    auth_port: int = 9090,
+    console_auth: bool = False,
+    auth_code: str | None = None,
+):
     """Return an authenticated Google Drive v3 service.
 
-    If service_account_file is given, authenticates as a service account (headless).
-    Otherwise falls back to OAuth2 using token.json / credentials.json.
+    Headless two-phase flow (--console-auth):
+      Phase 1 (no --auth-code): prints the authorization URL and exits.
+      Phase 2 (--auth-code CODE): exchanges the code for a token, saves token.json,
+        and returns the service. No interactive input required in either phase.
     """
     if service_account_file:
         creds = service_account.Credentials.from_service_account_file(
@@ -301,15 +325,38 @@ def get_drive_service(service_account_file: str | None = None, auth_port: int = 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+        elif console_auth:
+            import sys as _sys
+            from requests_oauthlib import OAuth2Session as _OA2
+            with open("credentials.json", encoding="utf-8") as _f:
+                _cfg = json.load(_f)
+            _inst = _cfg.get("installed") or _cfg.get("web")
+            _oauth = _OA2(_inst["client_id"], scope=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
+            if not auth_code:
+                _url, _ = _oauth.authorization_url(
+                    _inst["auth_uri"], access_type="offline", prompt="consent"
+                )
+                print(f"\nStep 1 — visit this URL in any browser:\n\n  {_url}\n")
+                print("Step 2 — re-run the same command, adding:  --auth-code <paste_code_here>\n")
+                _sys.exit(0)
+            os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+            _token = _oauth.fetch_token(
+                _inst["token_uri"], code=auth_code, client_secret=_inst["client_secret"]
+            )
+            creds = Credentials(
+                token=_token["access_token"],
+                refresh_token=_token.get("refresh_token"),
+                token_uri=_inst["token_uri"],
+                client_id=_inst["client_id"],
+                client_secret=_inst["client_secret"],
+                scopes=SCOPES,
+            )
         else:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             logger.info(
-                "Opening auth server on port %d. "
-                "If on a remote machine, forward the port through your relay:\n"
-                "  ssh -L %d:localhost:%d ubuntu@204.216.222.110 "
-                "-t ssh -L %d:localhost:%d -p 2222 marcello@localhost\n"
-                "Then visit the URL printed below in your local browser.",
-                auth_port, auth_port, auth_port, auth_port, auth_port,
+                "Starting local auth server on port %d (open_browser=False). "
+                "Visit the printed URL in a browser forwarded to this port.",
+                auth_port,
             )
             creds = flow.run_local_server(port=auth_port, open_browser=False)
         with open("token.json", "w", encoding="utf-8") as token:
@@ -335,6 +382,11 @@ def list_drive_files(service, folder_id: str) -> list[dict]:
         if not page_token:
             break
     return results
+
+
+def drive_tags(service, folder_id: str) -> set[str]:
+    """URL hash tags of every lesson file already in the Drive folder."""
+    return {t for f in list_drive_files(service, folder_id) if (t := file_tag(f["name"]))}
 
 
 def dedupe_drive_folder(service, folder_id: str, *, dry_run: bool = True) -> None:
@@ -420,8 +472,22 @@ def rename_drive_files(
     return renamed
 
 
-def upload_file_to_drive(service, file_path: str, filename: str, folder_id: str) -> None:
-    """Upload file_path to the given Drive folder. Skips if a file with the same name already exists."""
+def upload_file_to_drive(
+    service,
+    file_path: str,
+    filename: str,
+    folder_id: str,
+    known_tags: set[str] | None = None,
+) -> bool:
+    """Upload file_path to the given Drive folder; return True if uploaded.
+
+    Skips if a file with the same name exists, or (when known_tags is given) if the
+    folder already holds a file with the same URL hash tag under a different name.
+    """
+    tag = file_tag(filename)
+    if known_tags is not None and tag and tag in known_tags:
+        logger.info("GDrive: %s already present (tag %s), skipping", filename, tag)
+        return False
     files_resource = service.files() if callable(getattr(service, "files", None)) else service.files
     safe_name = filename.replace("\\", "\\\\").replace("'", "\\'")
     query = (
@@ -436,7 +502,7 @@ def upload_file_to_drive(service, file_path: str, filename: str, folder_id: str)
     )
     if existing:
         logger.info("GDrive: %s already exists, skipping", filename)
-        return
+        return False
 
     file_metadata: dict[str, object] = {"name": filename, "parents": [folder_id]}
     media = MediaFileUpload(file_path, resumable=True)
@@ -447,3 +513,6 @@ def upload_file_to_drive(service, file_path: str, filename: str, folder_id: str)
         if status:
             logger.debug("GDrive upload %s: %.1f%%", filename, status.progress() * 100)
     logger.info("GDrive: uploaded %s", filename)
+    if known_tags is not None and tag:
+        known_tags.add(tag)
+    return True

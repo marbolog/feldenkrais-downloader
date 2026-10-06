@@ -129,3 +129,19 @@ Each manifest line:
 ```
 
 Downloads are crash-safe: files are written to a `.part` temporary and renamed atomically. Already-downloaded files are skipped on re-runs.
+
+### Idempotency and finding new lessons
+
+The numeric filename prefix is the lesson's position in the sitemap and can shift between runs. Files are therefore matched by the 6-character URL hash in their name, not by exact name: a shifted index renames the existing file instead of re-downloading it, and Drive uploads are skipped when a file with the same hash is already in the folder. To find newly published lessons, just re-run the script; only audio URLs not yet present are downloaded and uploaded.
+
+Lesson pages are scanned in parallel (`--workers`); pages that fail (e.g. HTTP 503 rate limiting) are retried serially, and the run aborts if any page still cannot be read, so a failure is never mistaken for a patron-only lesson.
+
+### Drive authentication notes
+
+Use `--service-account-file sa.json` for headless runs (keep the key out of git; it is in `.gitignore`). The `--console-auth` copy-paste flow relies on Google's out-of-band redirect, which Google has retired, so prefer the service account or the local-server flow.
+
+## Tests
+
+```bash
+uv run pytest
+```

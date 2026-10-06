@@ -1,6 +1,11 @@
 credentials.json
 token.json
 downloads/
+.venv/
+sa.json
+*.db
+.claude-flow/
+.swarm/
 venv/
 __pycache__/
 *.pyc
